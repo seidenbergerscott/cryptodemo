@@ -1,0 +1,514 @@
+import streamlit as st
+import time
+import random
+import hashlib
+from collections import defaultdict, deque
+from typing import List
+import altair as alt
+import pandas as pd
+
+###############################################################################
+# 0. Basic WebSocket-like Notifier
+###############################################################################
+
+@st.cache_resource
+def get_notifier():
+    """
+    Global 'notifier' that calls back into each session to force a rerun.
+    Not real concurrency, but a toy local approach.
+    """
+    class Notifier:
+        def __init__(self):
+            self.callbacks = []
+            self.chain_version = 0  # increments each time the chain changes
+
+        def register(self, cb):
+            self.callbacks.append(cb)
+
+        def notify_all(self):
+            self.chain_version += 1
+            for c in self.callbacks:
+                try:
+                    c()
+                except:
+                    pass
+
+    return Notifier()
+
+def session_callback():
+    st.experimental_rerun()
+
+###############################################################################
+# 1. Global Blockchain Store
+###############################################################################
+
+@st.cache_resource
+def get_store():
+    """
+    Returns a dict with:
+     - blocks: { hash -> block_dict }
+     - tips: set of block_hashes considered chain tips (forks allowed)
+     - balances: { miner_name -> float }
+     - difficulty_bits: float (leading bits must be zero, higher=harder)
+     - target_time: float (desired block time in seconds)
+     - recent_times: track last ~20 block production times
+    """
+    return {
+        "blocks": {},
+        "tips": set(),
+        "balances": defaultdict(float),
+        "difficulty_bits": 16.0,
+        "target_time": 20.0,
+        "recent_times": deque(maxlen=20)
+    }
+
+def create_genesis_block():
+    now = time.time()
+    return {
+        "hash": "GENESIS",
+        "height": 0,
+        "parent": None,
+        "merkle_root": "GENESIS",
+        "nonce": 0,
+        "miner": "Satoshi(Genesis)",
+        "transactions": [],
+        "timestamp": now,
+        "block_time": 0.0,
+        "difficulty": 16.0,  # store difficulty at block creation
+    }
+
+###############################################################################
+# 2. Merkle Tree
+###############################################################################
+
+def merkle_root(transactions: List[dict]) -> str:
+    """Compute a simple Merkle root from a list of transaction dicts."""
+    if not transactions:
+        return hashlib.sha256(b"").hexdigest()
+
+    leaves = []
+    for tx in transactions:
+        raw = str(sorted(tx.items())).encode()
+        leaves.append(hashlib.sha256(raw).hexdigest())
+
+    while len(leaves) > 1:
+        if len(leaves) % 2 == 1:
+            leaves.append(leaves[-1])
+        new_level = []
+        for i in range(0, len(leaves), 2):
+            combo = (leaves[i] + leaves[i+1]).encode()
+            new_level.append(hashlib.sha256(combo).hexdigest())
+        leaves = new_level
+
+    return leaves[0]
+
+###############################################################################
+# 3. Hash + Difficulty
+###############################################################################
+
+def block_hash(parent_hash: str, height: int, merkle_root: str, nonce: int):
+    s = f"{parent_hash}|{height}|{merkle_root}|{nonce}"
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def meets_difficulty(hash_hex: str, difficulty_bits: float):
+    """
+    We interpret difficulty_bits so that if bits = 24, e.g., 
+    we require the first 24 bits of the hash to be zero => smaller target => harder.
+    """
+    db = max(1, min(256, int(difficulty_bits)))
+    target = 1 << (256 - db)
+    val = int(hash_hex, 16)
+    return val < target
+
+###############################################################################
+# 4. Add + Adjust chain
+###############################################################################
+
+def add_block_to_chain(store, block):
+    """
+    Insert block, keep multiple tips. 
+    No automatic removal of shorter tips => user can still build on them.
+    """
+    h = block["hash"]
+    store["blocks"][h] = block
+
+    # If parent was a tip, remove it
+    if block["parent"] in store["tips"]:
+        store["tips"].remove(block["parent"])
+
+    # Add ourselves as a tip
+    store["tips"].add(h)
+
+    # block reward
+    store["balances"][block["miner"]] += 50.0
+
+    # track block_time for difficulty adjustment
+    store["recent_times"].append(block["block_time"])
+
+    # Once we have at least 5 blocks in recent_times, adjust
+    if len(store["recent_times"]) >= 5:
+        adjust_difficulty(store)
+
+def adjust_difficulty(store):
+    """
+    If average block time < target => difficulty should go up
+    else difficulty should go down.
+
+    We do new_bits = old_bits * (target_time / avg_block_time).
+    That way if avg_block_time < target => ratio>1 => new_bits>old_bits => harder.
+    """
+    if len(store["recent_times"]) == 0:
+        return
+
+    avg_bt = sum(store["recent_times"]) / len(store["recent_times"])
+    old_bits = store["difficulty_bits"]
+
+    # The correct ratio to keep block time near target
+    ratio = store["target_time"] / avg_bt
+    new_bits = old_bits * ratio
+
+    new_bits = max(1.0, min(256.0, new_bits))
+    store["difficulty_bits"] = new_bits
+
+###############################################################################
+# 5. Mining chunked with "interrupt" check
+###############################################################################
+
+def chunked_mine_block(store, parent_hash, height, tx_list, miner_name, chunk_size, steps):
+    """
+    Returns (found_block, total_tries). If None => no block found.
+    If chain changes mid-mining => abort to avoid stale block.
+    """
+    if "nonce" not in st.session_state:
+        st.session_state["nonce"] = 0
+    if "start_time" not in st.session_state:
+        st.session_state["start_time"] = time.time()
+
+    notifier = get_notifier()
+    chain_ver_start = notifier.chain_version
+
+    mr = merkle_root(tx_list)
+    difficulty = store["difficulty_bits"]
+
+    total_tries = 0
+    found_block = None
+
+    for _ in range(steps):
+        for _ in range(chunk_size):
+            if notifier.chain_version != chain_ver_start:
+                st.info("Chain changed mid-mining. Aborting old block.")
+                return None, total_tries
+
+            nonce = st.session_state["nonce"]
+            h = block_hash(parent_hash, height, mr, nonce)
+            total_tries += 1
+            if meets_difficulty(h, difficulty):
+                block_time = time.time() - st.session_state["start_time"]
+                tx_copy = [dict(tx) for tx in tx_list]
+
+                b = {
+                    "hash": h,
+                    "height": height,
+                    "parent": parent_hash,
+                    "merkle_root": mr,
+                    "nonce": nonce,
+                    "miner": miner_name,
+                    "transactions": tx_copy,
+                    "timestamp": time.time(),
+                    "block_time": block_time,
+                    # store the difficulty at block creation
+                    "difficulty": store["difficulty_bits"],
+                }
+                found_block = b
+                break
+            st.session_state["nonce"] += 1
+
+        if found_block:
+            break
+
+    return found_block, total_tries
+
+def reset_mining_state():
+    st.session_state["nonce"] = 0
+    st.session_state["start_time"] = time.time()
+
+###############################################################################
+# 6. Utility: pick "longest" chain tip, or let user pick any block
+###############################################################################
+
+def get_chain_height(store, block_hash):
+    b = store["blocks"].get(block_hash)
+    return b["height"] if b else -1
+
+def get_best_tip(store):
+    if not store["tips"]:
+        return None
+    best = None
+    best_h = -1
+    for t in store["tips"]:
+        b = store["blocks"][t]
+        if b["height"] > best_h:
+            best_h = b["height"]
+            best = t
+    return best
+
+def walk_back_to_genesis(store, tip_hash):
+    chain = []
+    c = tip_hash
+    while True:
+        chain.append(c)
+        if c == "GENESIS":
+            break
+        b = store["blocks"].get(c)
+        if not b or not b["parent"]:
+            break
+        c = b["parent"]
+    return chain
+
+###############################################################################
+# 7. Main Tab (Mining + Chain)
+###############################################################################
+
+def main_tab():
+    st.header("Mining & Chain")
+
+    store = get_store()
+    notifier = get_notifier()
+    notifier.register(session_callback)
+
+    # if chain empty => genesis
+    if not store["blocks"]:
+        g = create_genesis_block()
+        store["blocks"]["GENESIS"] = g
+        store["tips"].add("GENESIS")
+
+    st.write(f"**Difficulty**: {store['difficulty_bits']:.2f} bits "
+             f"(target ~ {store['target_time']}s)")
+
+    # miner name
+    if "miner_name" not in st.session_state:
+        st.session_state["miner_name"] = f"Miner_{random.randint(1000,9999)}"
+    st.session_state["miner_name"] = st.text_input("Miner Name", st.session_state["miner_name"])
+    my_bal = store["balances"][st.session_state["miner_name"]]
+    st.write(f"Your balance: **{my_bal}** coins")
+
+    # If no blocks => do nothing
+    if not store["blocks"]:
+        st.warning("No chain found.")
+        return
+
+    # Build a sorted list of all blocks
+    all_blocks_info = []
+    for hsh, blk in store["blocks"].items():
+        all_blocks_info.append((hsh, blk["height"], blk["timestamp"]))
+    all_blocks_info.sort(key=lambda x: (x[1], x[2]))
+
+    block_labels = []
+    for (hsh, ht, ts) in all_blocks_info:
+        b = store["blocks"][hsh]
+        block_labels.append(f"{hsh[:8]}..(h={ht}, miner={b['miner']})")
+
+    if "chosen_block_idx" not in st.session_state:
+        best_tip = get_best_tip(store)
+        if best_tip:
+            idx = 0
+            for i, (hsh,ht,ts) in enumerate(all_blocks_info):
+                if hsh == best_tip:
+                    idx = i
+                    break
+            st.session_state["chosen_block_idx"] = idx
+        else:
+            st.session_state["chosen_block_idx"] = 0
+
+    chosen_idx = st.selectbox(
+        "Choose any block to mine on (to create or extend forks)",
+        options=range(len(all_blocks_info)),
+        format_func=lambda i: block_labels[i],
+        index=st.session_state["chosen_block_idx"]
+    )
+
+    if chosen_idx != st.session_state["chosen_block_idx"]:
+        st.session_state["chosen_block_idx"] = chosen_idx
+        reset_mining_state()
+
+    chosen_hash = all_blocks_info[st.session_state["chosen_block_idx"]][0]
+    chosen_blk = store["blocks"][chosen_hash]
+    next_height = chosen_blk["height"] + 1
+
+    # TX input
+    if "new_txs" not in st.session_state:
+        st.session_state["new_txs"] = []
+
+    with st.expander("Add Transactions"):
+        f_ = st.text_input("From")
+        t_ = st.text_input("To")
+        amt_ = st.number_input("Amount", 0.0, 9999.0, step=1.0)
+        if st.button("Add TX"):
+            st.session_state["new_txs"].append({
+                "from": f_,
+                "to": t_,
+                "amount": amt_,
+                "txid": f"tx_{random.randint(1,99999999)}"
+            })
+
+    st.write("**Transactions for next block**:")
+    if st.session_state["new_txs"]:
+        for tx in st.session_state["new_txs"]:
+            st.write(tx)
+    else:
+        st.write("_No transactions_")
+
+    if st.button("Clear TXs"):
+        st.session_state["new_txs"].clear()
+
+    chunk_size = st.number_input("Chunk size (hash attempts per step)", min_value=100, value=500)
+    steps = st.number_input("Steps per click", min_value=1, value=5)
+    if st.button("Reset Mining State"):
+        reset_mining_state()
+        st.info("Reset local nonce/time")
+
+    progress_bar = st.progress(0)
+    log_area = st.empty()
+
+    # Show current tips
+    st.subheader("Current Tips (Forks)")
+    for tip_hash in store["tips"]:
+        tb = store["blocks"][tip_hash]
+        st.write(f"- {tip_hash[:8]}.. (h={tb['height']}, miner={tb['miner']})")
+
+    if st.button("Start/Continue Mining"):
+        found_block = None
+        total_tries = 0
+        for i in range(steps):
+            fb, tries = chunked_mine_block(
+                store,
+                parent_hash=chosen_hash,
+                height=next_height,
+                tx_list=st.session_state["new_txs"],
+                miner_name=st.session_state["miner_name"],
+                chunk_size=chunk_size,
+                steps=1
+            )
+            total_tries += tries
+            progress_bar.progress(int(((i+1)/steps)*100))
+            log_area.write(f"Step {i+1}/{steps}, tried {tries}, total so far={total_tries}...")
+
+            if fb:
+                st.success(f"New block found at height={next_height}, hash={fb['hash'][:8]}.. after {total_tries} tries.")
+                st.write(f"Block time: {fb['block_time']:.2f} seconds")
+
+                add_block_to_chain(store, fb)
+                st.session_state["new_txs"].clear()
+                reset_mining_state()
+
+                get_notifier().notify_all()
+                break
+        else:
+            st.warning(f"No block found after {total_tries} tries, keep going if you like.")
+
+    # Show all blocks
+    st.subheader("All Blocks (Possible Forks)")
+    by_height = {}
+    for hsh, blk in store["blocks"].items():
+        by_height.setdefault(blk["height"], []).append(blk)
+    for hgt in sorted(by_height.keys()):
+        st.markdown(f"**Height {hgt}**:")
+        for blk in by_height[hgt]:
+            sid = blk["hash"][:8]
+            with st.expander(f"Block {sid} by {blk['miner']}", expanded=False):
+                st.json(blk)
+
+###############################################################################
+# 8. Transaction Explorer
+###############################################################################
+
+def transaction_explorer_tab():
+    st.header("Transaction Explorer (Longest Chain)")
+
+    store = get_store()
+    tip = get_best_tip(store)
+    if not tip:
+        st.write("No chain yet.")
+        return
+
+    chain_hashes = walk_back_to_genesis(store, tip)
+    chain_hashes.reverse()  # now from genesis up to tip
+    all_txs = []
+    for hsh in chain_hashes:
+        if hsh == "GENESIS":
+            continue
+        blk = store["blocks"][hsh]
+        for tx in blk["transactions"]:
+            all_txs.append({
+                "block_height": blk["height"],
+                "miner": blk["miner"],
+                "txid": tx["txid"],
+                "from": tx["from"],
+                "to": tx["to"],
+                "amount": tx["amount"]
+            })
+
+    if all_txs:
+        df = pd.DataFrame(all_txs)
+        st.write("**Transactions in best chain**:")
+        st.dataframe(df)
+        grouped = df.groupby("block_height").size().reset_index(name="tx_count")
+        c = alt.Chart(grouped).mark_bar().encode(
+            x=alt.X("block_height:O", title="Block Height"),
+            y=alt.Y("tx_count:Q", title="Tx Count"),
+            tooltip=["tx_count"]
+        )
+        st.altair_chart(c, use_container_width=True)
+    else:
+        st.write("No transactions found in the best chain (beyond genesis).")
+
+###############################################################################
+# 9. Stats Tab
+###############################################################################
+
+def stats_tab():
+    st.header("Block Time & Stats")
+    store = get_store()
+    blocks = list(store["blocks"].values())
+    # sort by height, then by timestamp
+    blocks.sort(key=lambda b: (b["height"], b["timestamp"]))
+
+    data_rows = []
+    for b in blocks:
+        data_rows.append({
+            "hash": b["hash"][:8],
+            "height": b["height"],
+            "miner": b["miner"],
+            "time": b["timestamp"],
+            "block_time": b["block_time"],
+            "difficulty": f"{b['difficulty']:.2f}"
+        })
+
+    df = pd.DataFrame(data_rows)
+    st.dataframe(df)
+    if len(df) > 1:
+        c = alt.Chart(df).mark_line(point=True).encode(
+            x=alt.X("height:O", title="Block Height"),
+            y=alt.Y("block_time:Q", title="Block Time (s)"),
+            tooltip=["hash", "miner", "block_time", "difficulty"]
+        )
+        st.altair_chart(c, use_container_width=True)
+
+###############################################################################
+# MAIN
+###############################################################################
+
+def main():
+    st.title("Proof-of-Work Demo")
+
+    # 3 tabs
+    tabs = st.tabs(["Mining & Chain", "Transaction Explorer", "Block Stats"])
+    with tabs[0]:
+        main_tab()
+    with tabs[1]:
+        transaction_explorer_tab()
+    with tabs[2]:
+        stats_tab()
+
+if __name__ == "__main__":
+    main()

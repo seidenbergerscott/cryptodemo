@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <title>No-React Client-Side Chunk Mining (No eval)</title>
+  </head>
+  <body>
+    <h3>Client-Side Chunk Miner (Prefix-based Difficulty)</h3>
+
+    <!-- A pseudo-form to avoid warnings about no name/id. -->
+    <form id="myform" name="myform" autocomplete="off" style="display:none;">
+      <label for="dummyInput">Hidden Field:</label>
+      <input type="text" id="dummyInput" name="dummyInput" autocomplete="off" value="dummy"/>
+    </form>
+
+    <!-- We'll show a status area: -->
+    <p id="statusArea">Ready...</p>
+
+    <!-- We'll load js-sha256, which doesn't rely on eval or new Function. -->
+    <script src="https://cdn.jsdelivr.net/npm/js-sha256@0.9.0/build/sha256.min.js"></script>
+
+    <script>
+      /*************************************************************
+       * 1) Required Streamlit "glue" code from the forum snippet
+       *************************************************************/
+      function sendMessageToStreamlitClient(type, data) {
+        const outData = Object.assign({isStreamlitMessage:true, type:type}, data);
+        window.parent.postMessage(outData, "*");
+      }
+      function init() {
+        sendMessageToStreamlitClient("streamlit:componentReady",{apiVersion:1});
+      }
+      function setFrameHeight(px) {
+        sendMessageToStreamlitClient("streamlit:setFrameHeight",{height:px});
+      }
+      function sendDataToPython(objValue) {
+        // Must pass { value:..., dataType:"json"} for Streamlit
+        sendMessageToStreamlitClient("streamlit:setComponentValue", {
+          value: objValue,
+          dataType: "json"
+        });
+      }
+      function onDataFromPython(e) {
+        if(!e.data || e.data.type!=="streamlit:render") return;
+        const args = e.data.args||{};
+        doChunk(args);
+      }
+      window.addEventListener("message", onDataFromPython);
+      window.addEventListener("load",()=>{
+        init();
+        setTimeout(()=>{
+          setFrameHeight(document.documentElement.scrollHeight);
+        },50);
+      });
+
+      /*************************************************************
+       * 2) Prefix-based difficulty approach: if difficulty=16 => first 4 hex=0
+       *************************************************************/
+      function meetsDifficultyPrefix(hashHex, difficultyBits) {
+        // e.g. bits=16 => neededHex=16/4=4 => require hashHex.slice(0,4)== "0000"
+        const neededNibbles = Math.floor(difficultyBits/4);
+        const prefix = "0".repeat(neededNibbles);
+        return hashHex.startsWith(prefix);
+      }
+
+      function doChunk(args) {
+        let parentHash = args.parent_hash||"GENESIS";
+        let height = args.height||1;
+        let mr = args.merkle_root||"FAKE_MR";
+        let difficulty = args.difficulty_bits||16;
+        let chunkSize = args.chunk_size||1000;
+        let currentNonce = args.current_nonce||0;
+
+        const startTime = performance.now();
+        let found=false;
+        let foundHash="";
+        let foundNonce=currentNonce;
+
+        for(let i=0; i<chunkSize; i++){
+          const testStr = parentHash+"|"+height+"|"+mr+"|"+foundNonce;
+          const h=sha256(testStr);
+          if(meetsDifficultyPrefix(h, difficulty)){
+            found=true;
+            foundHash=h;
+            break;
+          }
+          foundNonce++;
+        }
+        const endTime=performance.now();
+        const elapsedMs=endTime - startTime;
+
+        if(found){
+          sendDataToPython({
+            found:true,
+            hash:foundHash,
+            nonce:foundNonce,
+            elapsed_ms:elapsedMs
+          });
+        }else{
+          sendDataToPython({
+            found:false,
+            nonce:foundNonce,
+            elapsed_ms:elapsedMs
+          });
+        }
+      }
+    </script>
+  </body>
+</html>

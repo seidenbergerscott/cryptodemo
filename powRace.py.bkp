@@ -1,0 +1,215 @@
+import streamlit as st
+import time
+import hashlib
+import random
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+
+###############################################################################
+# GLOBAL STORE
+###############################################################################
+# We'll keep the chain in the same style as your "class_data" approach.
+# But we define a separate store for blocks. Or you can merge it into your
+# existing class_data if you prefer.
+
+def get_blockchain_store():
+    """
+    A cached resource storing:
+      - chain: list of blocks
+      - difficulty: integer
+    Each block is a dict:
+      {
+        "index": int,
+        "prev_hash": str,
+        "nonce": int,
+        "hash": str,
+        "miner": str,
+        "data": str,
+        "timestamp": float
+      }
+    """
+    if "global_blockchain" not in st.session_state:
+        st.session_state["global_blockchain"] = {
+            "chain": [],
+            "difficulty": 3
+        }
+    return st.session_state["global_blockchain"]
+
+###############################################################################
+# BLOCK UTILITIES
+###############################################################################
+def compute_block_hash(index: int, prev_hash: str, nonce: int, miner: str, data: str) -> str:
+    """
+    Hashes the block content with SHA-256.
+    """
+    block_str = f"{index}|{prev_hash}|{nonce}|{miner}|{data}"
+    return hashlib.sha256(block_str.encode()).hexdigest()
+
+def create_genesis_block():
+    """
+    Create a fixed genesis block. 
+    """
+    genesis_block = {
+        "index": 0,
+        "prev_hash": "0" * 64,  # dummy
+        "nonce": 0,
+        "hash": "GENESIS",
+        "miner": "Satoshi?",  # or empty
+        "data": "Genesis Block",
+        "timestamp": time.time()
+    }
+    return genesis_block
+
+###############################################################################
+# MINING LOGIC (chunked)
+###############################################################################
+def mine_next_block_in_chunks(difficulty: int, chunk_size: int = 10000):
+    """
+    Use st.session_state["mining_nonce"] to keep track of the current nonce
+    for the next block. The next block's index, prev_hash, etc. come from
+    the last block in the chain.
+    Returns (found, block_dict, tries_in_this_chunk).
+    """
+    bc_store = get_blockchain_store()
+    chain = bc_store["chain"]
+    # If chain is empty, create genesis
+    if not chain:
+        chain.append(create_genesis_block())
+
+    last_block = chain[-1]
+    next_index = len(chain)
+    prev_hash = last_block["hash"]
+    miner_name = st.session_state["miner_name"]
+    data = st.session_state["miner_data"]  # optional user-provided data
+
+    target_prefix = "0" * difficulty
+
+    if "mining_nonce" not in st.session_state:
+        st.session_state["mining_nonce"] = 0
+
+    tries = 0
+    for _ in range(chunk_size):
+        test_nonce = st.session_state["mining_nonce"]
+        block_hash = compute_block_hash(
+            index=next_index,
+            prev_hash=prev_hash,
+            nonce=test_nonce,
+            miner=miner_name,
+            data=data
+        )
+        tries += 1
+        if block_hash.startswith(target_prefix):
+            # Found a solution!
+            new_block = {
+                "index": next_index,
+                "prev_hash": prev_hash,
+                "nonce": test_nonce,
+                "hash": block_hash,
+                "miner": miner_name,
+                "data": data,
+                "timestamp": time.time()
+            }
+            return True, new_block, tries
+        st.session_state["mining_nonce"] += 1
+
+    return False, None, tries
+
+###############################################################################
+# PAGE LOGIC
+###############################################################################
+def main():
+    st.title("Multi-Miner Race: Proof-of-Work with Multiple Miners")
+    st.write("""
+    In this simulation:
+    - Each participant chooses a miner name.
+    - The global chain is shared in memory.
+    - Everyone tries to mine the *next block* at the same time.
+    - The first miner to find a valid nonce extends the chain.
+    - Then the race continues with the next block.
+    """)
+
+    bc_store = get_blockchain_store()
+    chain = bc_store["chain"]
+    difficulty = bc_store["difficulty"]
+
+    # If chain is empty, let's create a genesis block
+    if not chain:
+        chain.append(create_genesis_block())
+
+    st.write(f"**Current Difficulty**: {difficulty} (hash must start with {difficulty} zero nibbles).")
+
+    # Let user choose a name
+    if "miner_name" not in st.session_state:
+        st.session_state["miner_name"] = f"Miner_{random.randint(1000,9999)}"
+    st.session_state["miner_name"] = st.text_input("Your Miner Name", value=st.session_state["miner_name"])
+
+    # Optional: user data for block
+    if "miner_data" not in st.session_state:
+        st.session_state["miner_data"] = "Alice pays Bob 2 BTC"
+    st.session_state["miner_data"] = st.text_input("Transaction Data (for next block)", value=st.session_state["miner_data"])
+
+    # Show the chain
+    st.subheader("Current Blockchain")
+    if chain:
+        for blk in chain:
+            with st.expander(f"Block #{blk['index']} (Miner: {blk['miner']})", expanded=False):
+                st.write(f"**Index**: {blk['index']}")
+                st.write(f"**Prev Hash**: {blk['prev_hash']}")
+                st.write(f"**Nonce**: {blk['nonce']}")
+                st.write(f"**Hash**: {blk['hash']}")
+                st.write(f"**Data**: {blk['data']}")
+                st.write(f"**Timestamp**: {blk['timestamp']}")
+
+    # A quick button to reset chain (teacher might do this)
+    if st.button("Reset Entire Chain"):
+        chain.clear()
+        chain.append(create_genesis_block())
+        st.session_state["mining_nonce"] = 0
+        st.warning("Chain was reset! Back to genesis.")
+
+    # Difficulty slider?
+    # Let's allow the teacher or user to adjust it.
+    new_difficulty = st.slider("Adjust Difficulty", 1, 6, difficulty)
+    if new_difficulty != difficulty:
+        bc_store["difficulty"] = new_difficulty
+        st.session_state["mining_nonce"] = 0
+        st.info(f"Difficulty changed to {new_difficulty}, nonce reset to 0 for all miners.")
+    difficulty = bc_store["difficulty"]  # updated
+
+    # Mining parameters
+    chunk_size = st.number_input("Chunk Size (per attempt)", min_value=1, value=1000)
+    max_steps = st.number_input("Max Steps to Attempt This Round", min_value=1, value=10)
+
+    progress_bar = st.progress(0)
+    log_area = st.empty()
+
+    # Mining button
+    if st.button("Start/Continue Mining"):
+        total_tries = 0
+        found_block = False
+        for step_i in range(int(max_steps)):
+            found, new_block, tries = mine_next_block_in_chunks(difficulty, chunk_size)
+            total_tries += tries
+            progress = int(((step_i+1)/max_steps)*100)
+            progress_bar.progress(progress)
+
+            # show partial log
+            log_area.write(f"Step {step_i+1}/{max_steps}, tried {tries} nonces, total so far {total_tries}")
+
+            if found:
+                # If we found a solution, we finalize the block
+                chain.append(new_block)
+                st.success(f"**{st.session_state['miner_name']}** found a valid nonce after {total_tries} tries!")
+                st.balloons()
+                # Reset for next block
+                st.session_state["mining_nonce"] = 0
+                found_block = True
+                break
+
+        if not found_block:
+            st.warning(f"No valid nonce found after {total_tries} tries. You can continue searching in more steps!")
+
+    st.write("**After you or others run/refresh, check the chain again to see if someone else found the block!**")
+
+if __name__ == "__main__":
+    main()
