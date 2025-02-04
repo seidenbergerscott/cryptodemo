@@ -93,6 +93,7 @@ def merkle_root(transactions: List[dict]) -> str:
 
     leaves = []
     for tx in transactions:
+        # Sort items so that the hash is deterministic
         raw = str(sorted(tx.items())).encode()
         leaves.append(hashlib.sha256(raw).hexdigest())
 
@@ -115,6 +116,8 @@ def add_block_to_chain(store, block):
     """
     Insert block, keep multiple tips. 
     No automatic removal of shorter tips => user can still build on them.
+
+    We'll also apply all transactions, including coinbase, to user balances.
     """
     h = block["hash"]
     store["blocks"][h] = block
@@ -126,8 +129,20 @@ def add_block_to_chain(store, block):
     # Add ourselves as a tip
     store["tips"].add(h)
 
-    # block reward
-    store["balances"][block["miner"]] += 50.0
+    # Apply transactions to balances (so coinbase + user TXs get credited/deducted)
+    for tx in block["transactions"]:
+        if tx.get("coinbase"):
+            # The new coins minted
+            store["balances"][tx["to"]] += tx["amount"]
+        else:
+            # A user transaction
+            frm = tx["from"]
+            to = tx["to"]
+            amt = tx["amount"]
+            # In a real chain, you'd verify signatures + sufficient balance, etc.
+            # Here we'll trust it.
+            store["balances"][frm] -= amt
+            store["balances"][to] += amt
 
     # track block_time for difficulty adjustment
     store["recent_times"].append(block["block_time"])
@@ -138,10 +153,9 @@ def add_block_to_chain(store, block):
 
 def adjust_difficulty(store):
     """
-    If average block time < target => difficulty should go up
-    else difficulty should go down.
-
-    We do new_bits = old_bits * (target_time / avg_block_time).
+    If average block time < target => difficulty goes up
+    else difficulty goes down.
+    new_bits = old_bits * (target_time / avg_block_time).
     """
     if len(store["recent_times"]) == 0:
         return
@@ -149,6 +163,10 @@ def adjust_difficulty(store):
     old_bits = store["difficulty_bits"]
 
     ratio = store["target_time"] / avg_bt
+
+    if ratio > 1:
+        ratio = min(ratio, 1.001)
+
     new_bits = old_bits * ratio
     new_bits = max(1.0, min(256.0, new_bits))
     store["difficulty_bits"] = new_bits
@@ -216,7 +234,7 @@ def main_tab():
     my_bal = store["balances"][st.session_state["miner_name"]]
     st.write(f"Your balance: **{my_bal:.2f}** coins")
 
-    # Sort all blocks by height, then time
+    # Sort blocks by (height, time) for display
     all_blocks_info = []
     for hsh, blk in store["blocks"].items():
         all_blocks_info.append((hsh, blk["height"], blk["timestamp"]))
@@ -227,7 +245,7 @@ def main_tab():
         b = store["blocks"][hsh]
         block_labels.append(f"{hsh[:8]}..(h={ht}, miner={b['miner']})")
 
-    # Default chosen parent is best tip
+    # Default chosen parent = best tip
     if "chosen_block_idx" not in st.session_state:
         best_tip = get_best_tip(store)
         idx = 0
@@ -349,12 +367,13 @@ def main_tab():
 
         found = result.get("found", False)
         new_nonce = result.get("nonce", current_nonce)
-        st.session_state["current_nonce"] = new_nonce
 
         # For logging: how many tries in this chunk
         # If found, we effectively tried (new_nonce - old_nonce + 1).
         # If not found, we tried (new_nonce - old_nonce).
-        tries_this_chunk = (new_nonce - current_nonce) + (1 if found else 0)
+        old_nonce = current_nonce
+        st.session_state["current_nonce"] = new_nonce
+        tries_this_chunk = (new_nonce - old_nonce) + (1 if found else 0)
 
         status_area.write(f"**Chunk #{st.session_state['chunks_done']+1}**: Tried {tries_this_chunk} hashes.")
 
@@ -364,6 +383,17 @@ def main_tab():
             block_hash = result.get("hash", None)
             st.success(f"Block found at height={height}, hash={block_hash[:8]}..")
 
+            # Build the new block's transactions:
+            # Prepend the coinbase TX to the user's TXs
+            block_txs = [
+                {
+                    "coinbase": True,
+                    "to": st.session_state["miner_name"],
+                    "amount": 50.0,
+                    "txid": f"coinbase_{random.randint(1,9999999)}"
+                }
+            ] + st.session_state["new_txs"]
+
             new_block = {
                 "hash": block_hash,
                 "height": height,
@@ -371,12 +401,14 @@ def main_tab():
                 "merkle_root": mr,
                 "nonce": new_nonce,
                 "miner": st.session_state["miner_name"],
-                "transactions": st.session_state["new_txs"],
+                "transactions": block_txs,
                 "timestamp": time.time(),
                 "block_time": block_time,
                 "difficulty": difficulty,
             }
             add_block_to_chain(store, new_block)
+
+            # Clear local TXs and mining state
             st.session_state["new_txs"].clear()
             reset_mining_state()
 
@@ -420,20 +452,24 @@ def transaction_explorer_tab():
         return
     chain = walk_back_to_genesis(store, tip)
     chain.reverse()
+
     all_txs = []
     for hsh in chain:
         if hsh == "GENESIS":
             continue
         blk = store["blocks"][hsh]
         for tx in blk["transactions"]:
+            # Show coinbase TX if it exists, or normal TX
             all_txs.append({
                 "block_height": blk["height"],
                 "miner": blk["miner"],
                 "txid": tx["txid"],
-                "from": tx["from"],
-                "to": tx["to"],
+                "coinbase": tx.get("coinbase", False),
+                "from": tx.get("from", ""),
+                "to": tx.get("to", ""),
                 "amount": tx["amount"]
             })
+
     if all_txs:
         df = pd.DataFrame(all_txs)
         st.write("**Transactions in best chain**:")
@@ -484,7 +520,7 @@ def stats_tab():
 ###############################################################################
 
 def main():
-    st.title("Proof-of-Work Demo (Client-Side Chunked)")
+    st.title("Proof-of-Work Demo")
 
     # Initialize store with genesis if none
     store = get_store()
