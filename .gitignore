@@ -1,2 +1,6 @@
 browser_miner/frontend/node_modules
 __pycache__
+Cargo.lock
+rpc/nethermind/bin/
+rpc/nethermind/obj/
+rpc/lighthouse/target/
