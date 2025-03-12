@@ -1,213 +1,203 @@
 using System;
 using System.IO;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.Json.Nodes;
+using System.Threading;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
 
-public class Program
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+// --------------------------
+// 1) In-Memory State
+// --------------------------
+
+// Method call counters
+ConcurrentDictionary<string, int> methodCounts = new ConcurrentDictionary<string, int>();
+
+// Current block number (start at decimal 12345 = 0x3039)
+long blockNumber = 0x3039; 
+
+// Simple address => balance mapping (long). In real Ethereum, you'd need bigger integers.
+Dictionary<string, long> balances = new Dictionary<string, long>
 {
-    // -----------------------------
-    //  In-Memory State Simulation
-    // -----------------------------
-    private static long _blockNumber = 0x3039; // 0x3039 = 12345 in decimal
-    private static Dictionary<string, long> _balances = new Dictionary<string, long>
+    // Example addresses + balances:
+    ["0x1111111111111111111111111111111111111111"] = 0xDE0B6B3A7640000, // 1 ETH in wei
+    ["0x2222222222222222222222222222222222222222"] = 0x2540BE400        // 1e10 decimal
+};
+
+// --------------------------
+// 2) JSON-RPC Endpoint (POST /)
+// --------------------------
+app.MapPost("/", async context =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    string requestBody = await reader.ReadToEndAsync();
+
+    // For logging/demo:
+    Console.WriteLine($"[Server] Received request: {requestBody}");
+
+    try
     {
-        // Pretend these are Ethereum addresses
-        // The values are in "wei" (smallest unit), but we won't do real conversions here.
-        { "0x1111111111111111111111111111111111111111", 0xDE0B6B3A7640000 }, // 1 ETH in wei (hex) = 0xDE0B6B3A7640000
-        { "0x2222222222222222222222222222222222222222", 0x2540BE400 },        // 1e10 decimal
+        var requestJson = JsonNode.Parse(requestBody);
+        string method = requestJson?["method"]?.GetValue<string>() ?? "unknown";
+        int id = requestJson?["id"]?.GetValue<int>() ?? 1;
+        var paramArray = requestJson?["params"]?.AsArray();
+
+        // Increment the counter for this method
+        methodCounts.AddOrUpdate(method, 1, (_, oldVal) => oldVal + 1);
+
+        // Switch on the method name
+        JsonObject responseJson;
+        switch (method)
+        {
+            case "eth_blockNumber":
+                // Return blockNumber as hex
+                responseJson = BuildResult(id, $"0x{blockNumber:X}");
+                break;
+
+            case "eth_getBalance":
+                // params: [ address, blockParameter ], we ignore blockParameter for demo
+                if (paramArray == null || paramArray.Count < 1)
+                {
+                    responseJson = BuildError(id, -32602, "Invalid params for eth_getBalance");
+                }
+                else
+                {
+                    string address = paramArray[0]?.GetValue<string>()?.ToLower() ?? "";
+                    long bal = 0;
+                    if (balances.TryGetValue(address, out long foundBal))
+                    {
+                        bal = foundBal;
+                    }
+                    // Return as hex
+                    responseJson = BuildResult(id, $"0x{bal:X}");
+                }
+                break;
+
+            case "eth_sendTransaction":
+                // Accept a simplified object: { from, to, value }
+                if (paramArray == null || paramArray.Count < 1)
+                {
+                    responseJson = BuildError(id, -32602, "No transaction object");
+                    break;
+                }
+                var txObj = paramArray[0];
+                string from = txObj?["from"]?.GetValue<string>()?.ToLower() ?? "";
+                string to = txObj?["to"]?.GetValue<string>()?.ToLower() ?? "";
+                string valueHex = txObj?["value"]?.GetValue<string>() ?? "0x0";
+
+                long valueWei = HexToLong(valueHex);
+
+                // Adjust balances (extremely simplified)
+                if (!balances.ContainsKey(from)) balances[from] = 0;
+                if (!balances.ContainsKey(to)) balances[to] = 0;
+
+                balances[from] -= valueWei;
+                balances[to]   += valueWei;
+
+                // Increment block number for each transaction (fake mining)
+                Interlocked.Increment(ref blockNumber);
+
+                // Return a fake tx hash
+                string fakeTxHash = "0xFAKE" + Guid.NewGuid().ToString("N").Substring(0, 24);
+                responseJson = BuildResult(id, fakeTxHash);
+                break;
+
+            default:
+                responseJson = BuildError(id, -32601, $"Method {method} not found");
+                break;
+        }
+
+        // Write the response
+        string respString = responseJson.ToJsonString();
+        Console.WriteLine($"[Server] Response: {respString}");
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsync(respString);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Server] Error: {ex.Message}");
+        var errorJson = BuildError(1, -32700, "Parse error");
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsync(errorJson.ToJsonString());
+    }
+});
+
+// ------------------------------------------
+// 3) Stats Endpoint (GET /stats)
+// ------------------------------------------
+app.MapGet("/stats", (HttpContext context) =>
+{
+    // Build an object containing:
+    //   - Method counts
+    //   - Current blockNumber (both hex and decimal, if you like)
+    //   - Balances (in hex or decimal)
+    var stats = new
+    {
+        methodCounts = methodCounts,  // Key: methodName, Value: callCount
+        blockNumberHex = $"0x{blockNumber:X}",
+        blockNumberDec = blockNumber,
+        balances = BuildHexBalanceDict(balances)
     };
 
-    public static void Main(string[] args)
+    context.Response.ContentType = "application/json";
+    return JsonSerializer.Serialize(stats);
+});
+
+app.Run();
+
+// ------------------------------------------------------------------
+// Helper Methods
+// ------------------------------------------------------------------
+static JsonObject BuildResult(int id, string result)
+{
+    return new JsonObject
     {
-        Host.CreateDefaultBuilder(args)
-            .ConfigureWebHostDefaults(webBuilder =>
-            {
-                webBuilder.Configure(app =>
-                {
-                    // Default to http://localhost:5000
-                    app.Run(async context =>
-                    {
-                        if (context.Request.Method == "POST")
-                        {
-                            using var reader = new StreamReader(context.Request.Body);
-                            string requestBody = await reader.ReadToEndAsync();
+        ["jsonrpc"] = "2.0",
+        ["result"] = result,
+        ["id"] = id
+    };
+}
 
-                            // Log for demonstration
-                            Console.WriteLine($"[Server] Request: {requestBody}");
-
-                            try
-                            {
-                                var requestJson = JsonNode.Parse(requestBody);
-                                var method = requestJson?["method"]?.GetValue<string>();
-                                var id = requestJson?["id"]?.GetValue<int>() ?? 1;
-                                var paramArray = requestJson?["params"]?.AsArray();
-
-                                JsonObject responseJson;
-
-                                switch (method)
-                                {
-                                    case "net_version":
-                                        // Return "1" for Mainnet (in reality, it might be a different chain ID)
-                                        responseJson = BuildResultResponse(id, "1");
-                                        await WriteResponse(context, responseJson);
-                                        break;
-
-                                    case "eth_blockNumber":
-                                        // Return the block number in hex string format, e.g. "0x3039"
-                                        // Real spec: "result" must be a hex string
-                                        responseJson = BuildResultResponse(id, $"0x{_blockNumber:X}");
-                                        await WriteResponse(context, responseJson);
-                                        break;
-
-                                    case "eth_getBalance":
-                                        // Expects: [ address, blockParameter ], e.g. ["0xabc...", "latest"]
-                                        // We'll ignore blockParameter for simplicity and just do "latest".
-                                        if (paramArray == null || paramArray.Count < 1)
-                                        {
-                                            responseJson = BuildErrorResponse(id, -32602, "Invalid params");
-                                        }
-                                        else
-                                        {
-                                            var address = paramArray[0]?.GetValue<string>()?.ToLower();
-                                            // Return balance in hex
-                                            if (!string.IsNullOrEmpty(address) && _balances.ContainsKey(address))
-                                            {
-                                                long bal = _balances[address];
-                                                responseJson = BuildResultResponse(id, $"0x{bal:X}");
-                                            }
-                                            else
-                                            {
-                                                // If address not found, assume zero balance
-                                                responseJson = BuildResultResponse(id, "0x0");
-                                            }
-                                        }
-                                        await WriteResponse(context, responseJson);
-                                        break;
-
-                                    case "eth_sendTransaction":
-                                        // Typically: "params" => [ { from, to, value, ... } ]
-                                        // We'll do a simplified transaction with just (from, to, value)
-                                        if (paramArray == null || paramArray.Count < 1)
-                                        {
-                                            responseJson = BuildErrorResponse(id, -32602, "No transaction object provided");
-                                            await WriteResponse(context, responseJson);
-                                            break;
-                                        }
-
-                                        var txObj = paramArray[0];
-                                        var from = txObj?["from"]?.GetValue<string>()?.ToLower();
-                                        var to = txObj?["to"]?.GetValue<string>()?.ToLower();
-                                        var valueHex = txObj?["value"]?.GetValue<string>(); // e.g. "0x10"
-
-                                        if (string.IsNullOrEmpty(from) || string.IsNullOrEmpty(to) || string.IsNullOrEmpty(valueHex))
-                                        {
-                                            responseJson = BuildErrorResponse(id, -32602, "Transaction object missing fields");
-                                            await WriteResponse(context, responseJson);
-                                            break;
-                                        }
-
-                                        // Convert hex string to long (wei)
-                                        // In real Ethereum, these can exceed 64-bit range, but let's keep it simple
-                                        long weiValue = HexToLong(valueHex);
-
-                                        // Deduct from "from" balance, add to "to" balance
-                                        // (No real checks for insufficient balance, gas, etc.)
-                                        if (!_balances.ContainsKey(from))
-                                        {
-                                            // if not found, assume 0
-                                            _balances[from] = 0;
-                                        }
-                                        if (!_balances.ContainsKey(to))
-                                        {
-                                            _balances[to] = 0;
-                                        }
-
-                                        _balances[from] -= weiValue;
-                                        _balances[to] += weiValue;
-
-                                        // Fake: increment block number each time a tx is "mined"
-                                        Interlocked.Increment(ref _blockNumber);
-
-                                        // Return a fake transaction hash
-                                        var fakeTxHash = $"0xFAKE{Guid.NewGuid().ToString().Replace("-", "").Substring(0, 24)}";
-                                        responseJson = BuildResultResponse(id, fakeTxHash);
-                                        await WriteResponse(context, responseJson);
-                                        break;
-
-                                    default:
-                                        // Method not found
-                                        responseJson = BuildErrorResponse(id, -32601, $"Method {method} not found");
-                                        await WriteResponse(context, responseJson);
-                                        break;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[Server] Error parsing request: {ex}");
-                                var errorJson = BuildErrorResponse(1, -32700, "Parse error");
-                                await WriteResponse(context, errorJson);
-                            }
-                        }
-                        else
-                        {
-                            // Only POST is supported for JSON-RPC
-                            context.Response.StatusCode = 404;
-                        }
-                    });
-                });
-            })
-            .Build()
-            .Run();
-    }
-
-    // Build a success JSON-RPC response { "jsonrpc":"2.0", "result":..., "id":... }
-    private static JsonObject BuildResultResponse(int id, string result)
+static JsonObject BuildError(int id, int code, string message)
+{
+    return new JsonObject
     {
-        return new JsonObject
+        ["jsonrpc"] = "2.0",
+        ["error"] = new JsonObject
         {
-            ["jsonrpc"] = "2.0",
-            ["result"] = result,
-            ["id"] = id
-        };
-    }
+            ["code"] = code,
+            ["message"] = message
+        },
+        ["id"] = id
+    };
+}
 
-    // Build an error JSON-RPC response { "jsonrpc":"2.0", "error":{ "code":..., "message":... }, "id":... }
-    private static JsonObject BuildErrorResponse(int id, int code, string message)
+static long HexToLong(string hex)
+{
+    if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
     {
-        return new JsonObject
-        {
-            ["jsonrpc"] = "2.0",
-            ["error"] = new JsonObject
-            {
-                ["code"] = code,
-                ["message"] = message
-            },
-            ["id"] = id
-        };
+        hex = hex.Substring(2);
     }
+    return Convert.ToInt64(hex, 16);
+}
 
-    private static async Task WriteResponse(HttpContext context, JsonObject responseJson)
+static Dictionary<string, string> BuildHexBalanceDict(Dictionary<string, long> balances)
+{
+    // Return a new dict with the same keys, but hex-encoded string values
+    var result = new Dictionary<string, string>();
+    foreach (var kvp in balances)
     {
-        string responseString = responseJson.ToJsonString();
-        Console.WriteLine($"[Server] Response: {responseString}");
-        context.Response.ContentType = "application/json";
-        await context.Response.WriteAsync(responseString);
+        string addr = kvp.Key;
+        long bal = kvp.Value;
+        result[addr] = $"0x{bal:X}";
     }
-
-    // Convert hex string (e.g. "0x1A") to a long
-    private static long HexToLong(string hexStr)
-    {
-        if (hexStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-        {
-            hexStr = hexStr.Substring(2);
-        }
-        return Convert.ToInt64(hexStr, 16);
-    }
+    return result;
 }
